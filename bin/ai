@@ -271,8 +271,18 @@ def _clean_title(prompt: str, max_len: int = 55) -> str:
             title = title[len(prefix):].strip(".,:;! \n")
             break
 
+    # Shell/code/explain-комбо: берём только сам запрос после маркера
+    for marker in ("Задача: ", "Задание: ", "Дополнительный запрос:"):
+        idx = title.rfind(marker)
+        if idx != -1:
+            title = title[idx + len(marker):].strip()
+            break
+
     # Убираем шаблон "N/9 — описание." в начале
     title = re.sub(r'^\d+/9\s*[—–-]\s*[^.]*\.\s*', '', title).strip()
+
+    # Explain-режим: убираем фиксированную часть после описания уровня
+    title = re.sub(r'^Что это, в чём проблема, причина и как исправить\.?\s*', '', title).strip()
 
     # Берём первую строку
     title = title.split("\n")[0][:max_len].strip()
@@ -601,14 +611,16 @@ def main() -> None:
     response = handler(input_text, args)
 
     # ── Пост-обработка ────────────────────────────────────────────
+    # В Telegram уходит сырой текст БЕЗ ANSI-кодов
+    raw_response = response
     if not args.no_color:
         response = stylize(response)
 
     print(response)
 
     # ── Отправка в Telegram ───────────────────────────────────────
-    if args.send and response and not response.startswith("❌"):
-        ok = hermes_send(response, args.send)
+    if args.send and raw_response and not raw_response.startswith("❌"):
+        ok = hermes_send(raw_response, args.send)
         if ok:
             print(
                 color(f"\n📬 Отправлено в Telegram ({args.send})", "dim"),

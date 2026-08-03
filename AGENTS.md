@@ -15,24 +15,30 @@ the already-installed Hermes Agent. Hermes already has:
 - `hermes -z "prompt"` — one-shot, prints ONLY response text (pipe-friendly)
 - `hermes send --to telegram "msg"` — send to Telegram
 - `hermes chat -q "prompt" -Q` — quiet interactive chat
+- `hermes sessions rename <id> <title>` — rename a session
 
 ## Project layout
 
 ```
 ai-shell/
-├── bin/ai          # Main script (Python, canonical entry point)
-├── main.py         # Python stub for `uv run ai`
+├── bin/ai          # ★ Single-file Python CLI (canonical entry point)
+├── main.py         # Python stub so `uv run ai` works from the project dir
 ├── pyproject.toml  # uv project metadata
 ├── README.md       # User-facing docs
-├── INSTALL.md      # Setup & install
-├── DEVELOPER.md    # Dev guide: architecture, adding modes
+├── INSTALL.md      # Setup guide
+├── DEVELOPER.md    # Dev guide: adding modes, conventions
 └── AGENTS.md       # This file
 ```
 
 ## Script conventions
 
-- Python 3.12+ (stdlib only, no external deps), shebang `#!/usr/bin/env python3`
+- **Python 3.12+, stdlib only** — no external dependencies
 - Thin wrapper — all real work delegated to `hermes` CLI
 - stdin pipe support: `not sys.stdin.isatty()` detects piped input
-- Options via `argparse` with custom parser that suggests similar args on typos
-- `-1..-9` shorthand maps to `--verbose` (verbosity level)
+- `argparse` with smart typo suggestions (`AIArgumentParser` + `smart_suggest_arg`)
+- Modes: `general` / `shell` / `explain` / `code`, driven by `PROMPTS` dict + `MODE_MAP`
+- Verbose levels 1–9 via `-v N` or `-N` shorthand (`ai -5 "..."`)
+- stdout = answer only (pipe-friendly); stderr = diagnostics/status
+- `--send` sends the RAW (unstyled, no ANSI) response to Telegram
+- Session auto-rename: queries the local `~/.hermes/state.db` for the last CLI
+  session and renames it to `ai: <clean title>`
