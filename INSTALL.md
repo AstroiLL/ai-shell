@@ -7,11 +7,11 @@
 hermes --version
 
 # Установи ai одной командой:
-ln -sf ~/Sync/GPT/5-Progs/ai-shell/bin/ai ~/bin/ai
+ln -sf ~/Sync/GPT/5-Progs/ai-shell/bin/ai ~/.local/bin/ai
 
 # Проверь:
 ai -V
-# → ai-shell v0.2.0
+# → ai-shell v0.5.0
 ```
 
 ## Подробная установка
@@ -45,37 +45,37 @@ python3 --version    # >= 3.12
 #### Способ A: симлинк (рекомендуется)
 
 ```bash
-ln -sf ~/Sync/GPT/5-Progs/ai-shell/bin/ai ~/bin/ai
+ln -sf ~/Sync/GPT/5-Progs/ai-shell/bin/ai ~/.local/bin/ai
 ```
 
 Симлинк автоматически подхватывает обновления — правишь `bin/ai`
-в проекте, и `~/bin/ai` сразу обновляется.
+в проекте, и `~/.local/bin/ai` сразу обновляется.
 
 #### Способ B: копия
 
 ```bash
-cp ~/Sync/GPT/5-Progs/ai-shell/bin/ai ~/bin/ai
+cp ~/Sync/GPT/5-Progs/ai-shell/bin/ai ~/.local/bin/ai
 ```
 
-### 4. Убедись, что ~/bin в PATH
+### 4. Убедись, что ~/.local/bin в PATH
 
 Проверь:
 
 ```bash
-echo $PATH | grep --color=auto "$HOME/bin"
+echo $PATH | grep --color=auto "$HOME/.local/bin"
 ```
 
 Если не видно — добавь в `~/.bashrc` (или `~/.zshrc`):
 
 ```bash
-echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 source ~/.bashrc
 ```
 
 ### 5. Проверка
 
 ```bash
-ai -V                 # → ai-shell v0.2.0
+ai -V                 # → ai-shell v0.5.0
 ai "скажи привет"     # → Привет!
 ai -s "echo test"     # → echo test
 ```
@@ -246,12 +246,12 @@ hermes gateway status
 hermes gateway start
 ```
 
-### Скрипт обновился, а `~/bin/ai` нет
+### Скрипт обновился, а `~/.local/bin/ai` нет
 
 Если использовал симлинк — просто обнови файлы в проекте.
 Если копию — переустанови:
 ```bash
-cp ~/Sync/GPT/5-Progs/ai-shell/bin/ai ~/bin/ai
+cp ~/Sync/GPT/5-Progs/ai-shell/bin/ai ~/.local/bin/ai
 ```
 
 ### Hermes не в PATH

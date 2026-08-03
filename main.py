@@ -10,7 +10,7 @@ import sys
 
 
 def main() -> None:
-    """Delegate to the bash script."""
+    """Delegate to the main Python script."""
     script = __file__.rsplit("/", 2)[0] + "/bin/ai"
     subprocess.run([script, *sys.argv[1:]])
 

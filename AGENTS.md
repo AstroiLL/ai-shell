@@ -20,15 +20,19 @@ the already-installed Hermes Agent. Hermes already has:
 
 ```
 ai-shell/
-├── bin/ai          # Main shell script
-├── README.md       # User-facing docs
+├── bin/ai          # Main script (Python, canonical entry point)
+├── main.py         # Python stub for `uv run ai`
 ├── pyproject.toml  # uv project metadata
+├── README.md       # User-facing docs
+├── INSTALL.md      # Setup & install
+├── DEVELOPER.md    # Dev guide: architecture, adding modes
 └── AGENTS.md       # This file
 ```
 
 ## Script conventions
 
-- Bash, `set -euo pipefail`
+- Python 3.12+ (stdlib only, no external deps), shebang `#!/usr/bin/env python3`
 - Thin wrapper — all real work delegated to `hermes` CLI
-- stdin pipe support: `[[ ! -t 0 ]]` to detect piped input
-- Options before positional args, standard `getopts`-style `while` loop
+- stdin pipe support: `not sys.stdin.isatty()` detects piped input
+- Options via `argparse` with custom parser that suggests similar args on typos
+- `-1..-9` shorthand maps to `--verbose` (verbosity level)

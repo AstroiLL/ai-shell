@@ -5,7 +5,7 @@
 а использует уже настроенный Hermes с DeepSeek API, Gateway,
 Telegram и всеми инструментами.
 
-Документация: https://github.com/yourusername/ai-shell
+Документация: https://github.com/AstroiLL/ai-shell
 """
 
 from __future__ import annotations

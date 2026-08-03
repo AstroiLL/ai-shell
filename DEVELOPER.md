@@ -200,19 +200,19 @@ color("текст", "bold")    # акцент
 
 ```bash
 # Базовые режимы
-~/bin/ai "тест"
-echo "ошибка" | ~/bin/ai -e
-~/bin/ai -s "найти файлы"
-~/bin/ai --code "hello world"
+ai "тест"
+echo "ошибка" | ai -e
+ai -s "найти файлы"
+ai --code "hello world"
 
 # Pipe + args
-echo "context" | ~/bin/ai "проверка"
+echo "context" | ai "проверка"
 
 # Telegram
-~/bin/ai "тест" --send
+ai "тест" --send
 
 # Модели/провайдеры
-~/bin/ai -m deepseek/deepseek-chat "тест"
+ai -m deepseek/deepseek-chat "тест"
 ```
 
 Проверять нужно:
@@ -226,10 +226,12 @@ echo "context" | ~/bin/ai "проверка"
 ## 🗺 План расширения
 
 ```
-Фаза 1: MVP             ← сейчас
+Фаза 1: MVP             ✅ сделано (v0.5.0)
 ├── general / shell / explain / code
 ├── pipe / --send / --model
-└── цветной вывод
+├── цветной вывод
+├── -1..-9 / --verbose (детальность)
+└── --fix-sessions / умные подсказки
 
 Фаза 2: Улучшения       ← следующая
 ├── --chat (именованные сессии)

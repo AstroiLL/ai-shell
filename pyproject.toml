@@ -1,6 +1,6 @@
 [project]
 name = "ai-shell"
-version = "0.1.0"
+version = "0.5.0"
 description = "AI Shell — Hermes-powered CLI for quick AI queries, pipes, and Telegram delivery"
 readme = "README.md"
 requires-python = ">=3.12"
