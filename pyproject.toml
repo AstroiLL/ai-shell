@@ -1,0 +1,10 @@
+[project]
+name = "ai-shell"
+version = "0.1.0"
+description = "AI Shell — Hermes-powered CLI for quick AI queries, pipes, and Telegram delivery"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+ai = "ai_shell:main"  # legacy Python stub; real logic in bin/ai

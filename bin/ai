@@ -1,0 +1,625 @@
+#!/usr/bin/env python3
+"""ai — CLI утилита на базе Hermes Agent.
+
+Обёртка над Hermes, которая не переизобретает LLM-клиент,
+а использует уже настроенный Hermes с DeepSeek API, Gateway,
+Telegram и всеми инструментами.
+
+Документация: https://github.com/yourusername/ai-shell
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
+# ── Конфигурация ──────────────────────────────────────────────────────
+
+VERSION = "0.5.0"
+
+# Описание уровней детальности
+VERBOSE_MAP = {
+    1: "одна строка, только суть",
+    2: "2-3 строки, кратко",
+    3: "короткий абзац, основная мысль",
+    4: "несколько абзацев, с примерами",
+    5: "развёрнутый ответ с пояснениями",
+    6: "подробно, с примерами и альтернативами",
+    7: "очень подробно, с несколькими вариантами",
+    8: "максимально подробно, с полным разбором",
+    9: "исчерпывающе, с примерами, альтернативами и best practices",
+}
+
+# Промпты для режимов
+PROMPTS: dict[str, str] = {
+    "shell": (
+        "Ты — экспертный помощник в Linux/Unix shell. "
+        "Ответь ТОЛЬКО одной shell-командой (максимум одна строка, "
+        "без пояснений, без форматирования), которая решает задачу. "
+        "Задача: {query}"
+    ),
+    "explain": (
+        "Проанализируй содержимое ниже. "
+        "Уровень детальности: {verbose}/9 — {verbose_desc}. "
+        "Что это, в чём проблема, причина и как исправить."
+        "\n\n{input}"
+    ),
+    "code": (
+        "Напиши код на языке по заданию. "
+        "Уровень детальности: {verbose}/9 — {verbose_desc}. "
+        "Код в markdown-блоке, с пояснением сверху. "
+        "Задание: {query}"
+    ),
+    "general": (
+        "Ответь на запрос. "
+        "Уровень детальности: {verbose}/9 — {verbose_desc}."
+        "\n\n{query}"
+    ),
+}
+
+
+# Цвета для терминала (RGB true color, если поддерживается)
+_COLORS: dict[str, str] = {
+    "green": "\033[38;2;0;200;150m",
+    "blue": "\033[38;2;100;180;255m",
+    "dim": "\033[38;2;120;120;130m",
+    "red": "\033[38;2;255;80;80m",
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "yellow": "\033[38;2;255;200;50m",
+}
+
+# Список всех корректных аргументов для автоподсказок
+VALID_ARGS = [
+    "-s", "--shell",
+    "-e", "--explain",
+    "--code",
+    "-m", "--model",
+    "-p", "--provider",
+    "--send",
+    "-r", "--run",
+    "--no-color",
+    "-v", "--verbose",
+    "-V", "--version",
+    "-h", "--help",
+    "query",
+]
+
+
+def color(text: str, style: str) -> str:
+    """Вернуть текст с ANSI-цветом, если терминал поддерживает."""
+    if not sys.stdout.isatty():
+        return text
+    return _COLORS.get(style, "") + text + _COLORS["reset"]
+
+
+def stylize(text: str) -> str:
+    """Пост-процессинг ответа: подсветка shell-команд, markdown."""
+    if not sys.stdout.isatty():
+        return text
+    # Подсветка инлайн-кода
+    text = re.sub(r"`([^`]+)`", lambda m: color(m.group(1), "green"), text)
+    # Подсветка блоков кода (первые и последние ```)
+    lines = text.split("\n")
+    result: list[str] = []
+    in_code = False
+    for line in lines:
+        if line.startswith("```") and not in_code:
+            result.append(color(line, "dim"))
+            in_code = True
+        elif line.startswith("```") and in_code:
+            result.append(color(line, "dim"))
+            in_code = False
+        elif in_code:
+            result.append(color(line, "blue"))
+        else:
+            result.append(line)
+    return "\n".join(result)
+
+
+def smart_suggest_arg(bad_arg: str) -> list[str]:
+    """Подобрать похожие корректные аргументы к ошибочному."""
+    suggestions = difflib.get_close_matches(bad_arg, VALID_ARGS, n=3, cutoff=0.3)
+    # Ещё ручные подсказки для частых опечаток
+    manual: dict[str, list[str]] = {
+        "-x": ["-s", "-e"],
+        "-a": ["-s", "-e"],
+        "-c": ["--code"],
+        "-d": ["--send"],
+        "-f": ["--code"],
+        "-g": ["-s"],
+        "-h": ["-h"],
+        "-i": ["-s", "-e"],
+        "-k": ["--code"],
+        "-l": ["--shell", "-s"],
+        "-n": ["--no-color"],
+        "-o": ["--code", "--model"],
+        "-q": ["--code"],
+        "-t": ["--send"],
+        "-u": ["--run", "-r"],
+        "-w": ["--code"],
+        "-y": ["-s", "-e"],
+        "-help": ["--help", "-h"],
+        "-ver": ["-V", "--version"],
+        "-vrb": ["--verbose"],
+        "--expl": ["--explain", "-e"],
+        "--sh": ["--shell", "-s"],
+        "--ver": ["--version", "-V"],
+        "--hlp": ["--help", "-h"],
+        "--mdl": ["--model"],
+        "--prov": ["--provider"],
+    }
+    if bad_arg in manual:
+        for s in manual[bad_arg]:
+            if s not in suggestions:
+                suggestions.append(s)
+    return suggestions
+
+
+# ── Кастомный ArgumentParser с умной обработкой ошибок ─────────────
+
+class AIArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser, который при ошибке подсказывает похожие аргументы."""
+
+    def error(self, message: str) -> None:
+        """Перехватываем ошибку, дополняем подсказкой и выходим."""
+        # Стандартное сообщение об ошибке
+        self.print_usage(sys.stderr)
+        args = sys.argv[1:] if len(sys.argv) > 1 else []
+        err_msg = f"{self.prog}: error: {message}"
+        print(color(err_msg, "red"), file=sys.stderr)
+
+        # Ищем ошибочный аргумент и предлагаем исправление
+        for arg in args:
+            if arg.startswith("-"):
+                suggestions = smart_suggest_arg(arg)
+                if suggestions:
+                    hint = " или ".join(f"`ai {s}`" for s in suggestions[:2])
+                    print(
+                        color(f"💡 Возможно, вы хотели: {hint}", "yellow"),
+                        file=sys.stderr,
+                    )
+                    break
+
+        sys.exit(2)
+
+
+# ── Hermes bridge ─────────────────────────────────────────────────────
+
+def hermes_available() -> bool:
+    """Проверить, что hermes доступен в PATH."""
+    return shutil.which("hermes") is not None
+
+
+def hermes_query(prompt: str, *, model: str = "", provider: str = "",
+                 quiet: bool = True) -> str:
+    """Выполнить запрос к Hermes, вернуть только текст ответа.
+
+    Использует `hermes -z` (one-shot), который печатает ТОЛЬКО
+    финальный ответ в stdout — идеально для пайпов.
+    """
+    cmd = ["hermes", "-z", prompt]
+
+    if model:
+        cmd += ["--model", model]
+    if provider:
+        cmd += ["--provider", provider]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return color("⏱ Таймаут: Hermes не ответил за 120 секунд", "red")
+    except FileNotFoundError:
+        return color("❌ Hermes не найден. Установи: curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash", "red")
+
+    if result.returncode != 0:
+        err = result.stderr.strip() or "неизвестная ошибка"
+        return color(f"❌ Ошибка Hermes: {err}", "red")
+
+    # Переименовываем сессию в читаемое название
+    _rename_last_session(prompt)
+
+    return result.stdout.strip()
+
+
+def hermes_send(message: str, target: str = "telegram") -> bool:
+    """Отправить сообщение через Hermes Gateway."""
+    try:
+        result = subprocess.run(
+            ["hermes", "send", "--to", target, message],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+# ── Управление названиями сессий ─────────────────────────────────────
+
+SESSION_DB = Path.home() / ".hermes" / "state.db"
+
+# Префиксы, которые нужно убирать из названия
+_TITLE_CLEANUP = [
+    "Проанализируй содержимое ниже. Уровень детальности:",
+    "Ответь на запрос. Уровень детальности:",
+    "Напиши код на языке по заданию. Уровень детальности:",
+    "Ты — экспертный помощник в Linux/Unix shell. Ответь ТОЛЬКО одной shell-командой",
+]
+
+
+def _clean_title(prompt: str, max_len: int = 55) -> str:
+    """Создать читаемое название сессии из промпта."""
+    title = prompt.strip()
+    # Убираем префиксы системных промптов
+    for prefix in _TITLE_CLEANUP:
+        if title.startswith(prefix):
+            title = title[len(prefix):].strip(".,:;! \n")
+            break
+
+    # Убираем шаблон "N/9 — описание." в начале
+    title = re.sub(r'^\d+/9\s*[—–-]\s*[^.]*\.\s*', '', title).strip()
+
+    # Берём первую строку
+    title = title.split("\n")[0][:max_len].strip()
+    # Убираем лишние пробелы и знаки препинания в конце
+    title = re.sub(r'\s+', ' ', title).rstrip(".,:;!? ")
+    if not title or len(title) < 3:
+        title = "ai-shell запрос"
+    return f"ai: {title}"
+
+
+def _get_last_cli_session_id() -> str | None:
+    """Вернуть ID последней CLI-сессии из state.db."""
+    if not SESSION_DB.exists():
+        return None
+    try:
+        conn = sqlite3.connect(str(SESSION_DB))
+        row = conn.execute(
+            "SELECT id FROM sessions WHERE source='cli' ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def _rename_last_session(prompt: str) -> None:
+    """Переименовать последнюю CLI-сессию в читаемое название."""
+    session_id = _get_last_cli_session_id()
+    if not session_id:
+        return
+    title = _clean_title(prompt)
+    try:
+        subprocess.run(
+            ["hermes", "sessions", "rename", session_id, title],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        pass
+
+
+def fix_session_titles() -> int:
+    """Исправить названия всех CLI-сессий без title.
+
+    Возвращает количество переименованных сессий.
+    """
+    if not SESSION_DB.exists():
+        print(color("❌ state.db не найден", "red"), file=sys.stderr)
+        return 0
+
+    try:
+        conn = sqlite3.connect(str(SESSION_DB))
+        rows = conn.execute("""
+            SELECT s.id, m.content
+            FROM sessions s
+            JOIN messages m ON m.session_id = s.id AND m.role = 'user'
+            WHERE s.source = 'cli' AND (s.title IS NULL OR s.title = '')
+            GROUP BY s.id
+            ORDER BY s.rowid
+        """).fetchall()
+        conn.close()
+    except Exception as e:
+        print(color(f"❌ Ошибка БД: {e}", "red"), file=sys.stderr)
+        return 0
+
+    count = 0
+    for session_id, content in rows:
+        title = _clean_title(content)
+        try:
+            subprocess.run(
+                ["hermes", "sessions", "rename", session_id, title],
+                capture_output=True, text=True, timeout=10,
+            )
+            count += 1
+        except Exception:
+            pass
+
+    return count
+
+
+# ── Утилиты для verbose ─────────────────────────────────────────────
+
+def verbose_desc(level: int) -> str:
+    """Вернуть текстовое описание уровня детальности."""
+    return VERBOSE_MAP.get(level, VERBOSE_MAP[5])
+
+
+def verbose_prompt_kwargs(args: argparse.Namespace) -> dict[str, str | int]:
+    """Вернуть словарь для форматирования промпта с учётом verbose."""
+    v = max(1, min(9, args.verbose))
+    return {"verbose": v, "verbose_desc": verbose_desc(v)}
+
+
+# ── Режимы ────────────────────────────────────────────────────────────
+
+def mode_general(query: str, args: argparse.Namespace) -> str:
+    """Прямой вопрос."""
+    prompt = PROMPTS["general"].format(query=query, **verbose_prompt_kwargs(args))
+    return hermes_query(prompt, model=args.model, provider=args.provider)
+
+
+def mode_shell(query: str, args: argparse.Namespace) -> str:
+    """Сгенерировать shell-команду."""
+    # Shell всегда краткий (одна команда) — verbose не влияет
+    prompt = PROMPTS["shell"].format(query=query)
+    response = hermes_query(prompt, model=args.model, provider=args.provider)
+
+    # Пост-обработка: если ответ — одна строка с командой,
+    # показываем с подсветкой и спрашиваем, выполнить ли
+    if args.run and response and not response.startswith("❌"):
+        return _prompt_run_command(response)
+    return response
+
+
+def mode_explain(input_text: str, args: argparse.Namespace) -> str:
+    """Объяснить ошибку/вывод."""
+    prompt = PROMPTS["explain"].format(input=input_text, **verbose_prompt_kwargs(args))
+    return hermes_query(prompt, model=args.model, provider=args.provider)
+
+
+def mode_code(query: str, args: argparse.Namespace) -> str:
+    """Сгенерировать код."""
+    prompt = PROMPTS["code"].format(query=query, **verbose_prompt_kwargs(args))
+    return hermes_query(prompt, model=args.model, provider=args.provider)
+
+
+def _prompt_run_command(cmd: str) -> str:
+    """Предложить выполнить команду (интерактивно)."""
+    print(color(f"\n💻 {cmd}", "bold"), file=sys.stderr)
+    print(color("  Выполнить? [Y/n] ", "dim"), end="", file=sys.stderr)
+    try:
+        answer = input().strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return color("\n⏹ Отменено", "dim")
+
+    if answer in ("", "y", "yes"):
+        print(color(f"▶ Выполняю: {cmd}", "blue"), file=sys.stderr)
+        os.system(cmd)
+        return color("✓ Команда выполнена", "green")
+    else:
+        return color("⏹ Отменено", "dim")
+
+
+# ── CLI entry ─────────────────────────────────────────────────────────
+
+MODE_MAP = {
+    "general": mode_general,
+    "shell": mode_shell,
+    "explain": mode_explain,
+    "code": mode_code,
+}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = AIArgumentParser(
+        prog="ai",
+        description="AI CLI — обёртка над Hermes Agent",
+        epilog=(
+            "Примеры:\n"
+            '  ai "как найти все jar файлы"\n'
+            '  ai -s "заархивировать логи за вчера"\n'
+            '  make 2>&1 | ai -e "проанализируй ошибку"\n'
+            '  ai --code "python-скрипт бэкапа"\n'
+            "  make 2>&1 | ai                          # авто-explain\n"
+            "  ai -7 \"вопрос\"                        # уровень детальности 7\n"
+            '  ps aux | ai "найди java процессы"\n'
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    parser.add_argument("query", nargs="*", help="Текст запроса")
+
+    # Режимы
+    parser.add_argument(
+        "-s", "--shell",
+        action="store_true",
+        help="Режим shell: сгенерировать команду",
+    )
+    parser.add_argument(
+        "-e", "--explain",
+        action="store_true",
+        help="Режим explain: объяснить вывод/ошибку из stdin + опциональный запрос",
+    )
+    parser.add_argument(
+        "--code",
+        action="store_true",
+        help="Режим code: сгенерировать код",
+    )
+
+    # Опции
+    parser.add_argument(
+        "-v", "--verbose",
+        type=int,
+        default=5,
+        metavar="1-9",
+        help="Уровень детальности: 1..9 (кратко..подробно) через -1..-9 или --verbose 5 (по умолч. 5)",
+    )
+    parser.add_argument(
+        "-m", "--model",
+        default="",
+        help="Модель (например, anthropic/claude-sonnet-4)",
+    )
+    parser.add_argument(
+        "-p", "--provider",
+        default="",
+        help="Провайдер (например, openrouter, deepseek)",
+    )
+    parser.add_argument(
+        "--send",
+        nargs="?",
+        const="telegram",
+        default=None,
+        metavar="TARGET",
+        help="Отправить результат в Telegram (или указать target)",
+    )
+    parser.add_argument(
+        "-r", "--run",
+        action="store_true",
+        help="В режиме --shell: выполнить команду после генерации",
+    )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Отключить цветной вывод",
+    )
+    parser.add_argument(
+        "-V", "--version",
+        action="store_true",
+        help="Показать версию",
+    )
+    parser.add_argument(
+        "--fix-sessions",
+        action="store_true",
+        help="Исправить названия всех старых CLI-сессий в БД Hermes",
+    )
+
+    return parser
+
+
+def main() -> None:
+    # ── Преобразуем -1...-9 в --verbose N ──────────────────────────
+    # Чтобы можно было писать ai -5 "вопрос" вместо ai -v 5
+    transformed = [sys.argv[0]]
+    for arg in sys.argv[1:]:
+        m = re.match(r'^-([1-9])$', arg)
+        if m:
+            transformed.append("--verbose")
+            transformed.append(m.group(1))
+        else:
+            transformed.append(arg)
+    sys.argv = transformed
+
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.version:
+        print(f"ai-shell v{VERSION}")
+        sys.exit(0)
+
+    # ── Исправление старых сессий ────────────────────────────────
+    if args.fix_sessions:
+        print(color("🔄 Исправляю названия CLI-сессий в БД Hermes...", "dim"), file=sys.stderr)
+        count = fix_session_titles()
+        print(color(f"✅ Исправлено {count} сессий", "green"), file=sys.stderr)
+        sys.exit(0)
+
+    # Проверка Hermes
+    if not hermes_available():
+        print(
+            color("❌ Hermes не найден в PATH.", "red"),
+            file=sys.stderr,
+        )
+        print(
+            "Установи: curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # ── Определяем режим ──────────────────────────────────────────
+    mode = "general"
+    if args.shell:
+        mode = "shell"
+    elif args.explain:
+        mode = "explain"
+    elif args.code:
+        mode = "code"
+
+    # ── Собираем входные данные ───────────────────────────────────
+    prompt = " ".join(args.query) if args.query else ""
+    stdin_data = ""
+    has_stdin = not sys.stdin.isatty()
+
+    if has_stdin:
+        stdin_data = sys.stdin.read().strip()
+
+    # Логика комбинирования stdin + args:
+    #   make 2>&1 | ai                       → авто-explain
+    #   make 2>&1 | ai "найди решение"       → контекст + запрос
+    #   make 2>&1 | ai -e "запрос"           → stdin+args комбинируются
+    #   make 2>&1 | ai -e                    → stdin=input_for_explain
+    #   cat file | ai                         → stdin=prompt
+    #   ai "вопрос"                           → args=prompt
+    #   ai                                     → помощь
+    if mode == "explain":
+        if stdin_data and prompt:
+            input_text = f"Вывод команды:\n{stdin_data}\n\nДополнительный запрос:\n{prompt}"
+        else:
+            input_text = stdin_data or prompt
+    elif stdin_data and prompt:
+        # Есть и контекст, и запрос
+        input_text = f"Контекст:\n{stdin_data}\n\nЗапрос:\n{prompt}"
+    elif prompt:
+        input_text = prompt
+    elif stdin_data:
+        # Только пайп без запроса → авто-explain
+        mode = "explain"
+        input_text = stdin_data
+    else:
+        parser.print_help()
+        print(
+            "\n" + color("💡 Подсказка: передай вопрос или используй пайп.", "dim"),
+        )
+        sys.exit(1)
+
+    # ── Выполняем запрос ──────────────────────────────────────────
+    handler = MODE_MAP.get(mode, mode_general)
+    response = handler(input_text, args)
+
+    # ── Пост-обработка ────────────────────────────────────────────
+    if not args.no_color:
+        response = stylize(response)
+
+    print(response)
+
+    # ── Отправка в Telegram ───────────────────────────────────────
+    if args.send and response and not response.startswith("❌"):
+        ok = hermes_send(response, args.send)
+        if ok:
+            print(
+                color(f"\n📬 Отправлено в Telegram ({args.send})", "dim"),
+                file=sys.stderr,
+            )
+        else:
+            print(
+                color(f"\n❌ Не удалось отправить в Telegram ({args.send})", "red"),
+                file=sys.stderr,
+            )
+
+
+if __name__ == "__main__":
+    main()
