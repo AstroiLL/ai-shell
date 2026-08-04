@@ -2,7 +2,7 @@
 """ai — CLI утилита на базе Hermes Agent.
 
 Обёртка над Hermes, которая не переизобретает LLM-клиент,
-а использует уже настроенный Hermes с DeepSeek API, Gateway,
+а использует уже настроенный Hermes с моделями, API, Gateway,
 Telegram и всеми инструментами.
 
 Документация: https://github.com/AstroiLL/ai-shell
