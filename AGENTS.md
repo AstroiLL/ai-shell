@@ -13,9 +13,20 @@ the already-installed Hermes Agent. Hermes already has:
 ## Key commands
 
 - `hermes -z "prompt"` — one-shot, prints ONLY response text (pipe-friendly)
+- `hermes chat -q "msg" -Q` — one-shot chat; prints `session_id: <id>` to stderr
+  in non-tty mode (stdout in tty). Resume with `--resume <id>` to keep context
 - `hermes send --to telegram "msg"` — send to Telegram
 - `hermes chat -q "prompt" -Q` — quiet interactive chat
 - `hermes sessions rename <id> <title>` — rename a session
+
+## Chat mode (--chat)
+
+- Registry: `~/.config/ai-shell/chats.json` (name → session_id, title, updated)
+- First message creates a session (`hermes chat -q -Q`), subsequent ones
+  resume it (`--resume <id>`) — this is what keeps context across calls
+- REPL lives in `chat_repl()`; slash commands: /help /exit /new /sessions
+  /model /clear /send /delete
+- `ai --chat -n имя "вопрос"` = one-shot into a named session (pipeline-friendly)
 
 ## Project layout
 

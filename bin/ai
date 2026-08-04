@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import json
 import os
 import re
 import shutil
@@ -19,11 +20,12 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
+from datetime import datetime
 from pathlib import Path
 
 # ── Конфигурация ──────────────────────────────────────────────────────
 
-VERSION = "0.5.0"
+VERSION = "0.7.0"
 
 # Описание уровней детальности
 VERBOSE_MAP = {
@@ -82,10 +84,15 @@ VALID_ARGS = [
     "-s", "--shell",
     "-e", "--explain",
     "--code",
+    "-c", "--copy",
     "-m", "--model",
     "-p", "--provider",
     "--send",
     "-r", "--run",
+    "--chat",
+    "-n", "--name",
+    "-l", "--list-chats",
+    "-d", "--delete-chat",
     "--no-color",
     "-v", "--verbose",
     "-V", "--version",
@@ -132,7 +139,6 @@ def smart_suggest_arg(bad_arg: str) -> list[str]:
     manual: dict[str, list[str]] = {
         "-x": ["-s", "-e"],
         "-a": ["-s", "-e"],
-        "-c": ["--code"],
         "-d": ["--send"],
         "-f": ["--code"],
         "-g": ["-s"],
@@ -192,6 +198,26 @@ class AIArgumentParser(argparse.ArgumentParser):
         sys.exit(2)
 
 
+def copy_to_clipboard(text: str) -> bool:
+    """Скопировать текст в буфер обмена. X11 → xclip, Wayland → wl-copy."""
+    if not text:
+        return False
+    try:
+        if os.environ.get("WAYLAND_DISPLAY"):
+            result = subprocess.run(
+                ["wl-copy"], input=text, text=True,
+                capture_output=True, timeout=5,
+            )
+        else:
+            result = subprocess.run(
+                ["xclip", "-selection", "clipboard"],
+                input=text, text=True, capture_output=True, timeout=5,
+            )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
 # ── Hermes bridge ─────────────────────────────────────────────────────
 
 def hermes_available() -> bool:
@@ -247,6 +273,222 @@ def hermes_send(message: str, target: str = "telegram") -> bool:
         return result.returncode == 0
     except Exception:
         return False
+
+
+# ── Чат: интерактивные сессии с контекстом ─────────────────────────
+
+CHATS_DIR = Path.home() / ".config" / "ai-shell"
+CHATS_FILE = CHATS_DIR / "chats.json"
+CHAT_TIMEOUT = 300  # секунд на ответ агента
+
+CHAT_HELP = """Доступные команды:
+  /help              показать эту справку
+  /exit, /quit       выйти из чата
+  /new [имя]         начать новую сессию (или переключиться на имя)
+  /sessions          список сохранённых чатов
+  /model <модель>    сменить модель на лету
+  /clear             очистить экран
+  /send [target]     отправить последний ответ в Telegram
+  /delete            удалить текущий чат из реестра
+"""
+
+
+def chats_load() -> dict:
+    """Загрузить реестр чатов (имя → session_id, title, updated)."""
+    try:
+        if CHATS_FILE.exists():
+            return json.loads(CHATS_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def chats_save(chats: dict) -> None:
+    """Сохранить реестр чатов."""
+    try:
+        CHATS_DIR.mkdir(parents=True, exist_ok=True)
+        CHATS_FILE.write_text(json.dumps(chats, ensure_ascii=False, indent=2))
+    except OSError:
+        pass
+
+
+def chat_get_session(name: str) -> str | None:
+    """Вернуть session_id для имени чата (или None)."""
+    info = chats_load().get(name)
+    return info.get("session_id") if info else None
+
+
+def chat_save_session(name: str, session_id: str, first_message: str = "") -> None:
+    """Сохранить/обновить session_id для имени чата.
+
+    Если у чата ещё нет названия и дано первое сообщение — задаём
+    читаемый title и переименовываем сессию в Hermes (best effort).
+    """
+    chats = chats_load()
+    info = chats.get(name, {})
+    if not info.get("title") and first_message:
+        info["title"] = _clean_title(first_message)
+        try:
+            subprocess.run(
+                ["hermes", "sessions", "rename", session_id, info["title"]],
+                capture_output=True, text=True, timeout=10,
+            )
+        except Exception:
+            pass
+    info["session_id"] = session_id
+    info["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    chats[name] = info
+    chats_save(chats)
+
+
+def chat_list() -> None:
+    """Показать список сохранённых чатов."""
+    chats = chats_load()
+    if not chats:
+        print(color("📭 Нет сохранённых чатов. Создай: ai --chat", "dim"))
+        return
+    print(color("💬 Сохранённые чаты:", "bold"))
+    for name, info in sorted(chats.items()):
+        sid = (info.get("session_id") or "—")[:8]
+        title = info.get("title", "")[:45]
+        updated = info.get("updated", "")
+        print(f"  {color(name, 'green'):22} {color(sid, 'dim'):10} {title} {color(updated, 'dim')}")
+
+
+def chat_delete(name: str) -> bool:
+    """Удалить чат из реестра (сессия в Hermes остаётся)."""
+    chats = chats_load()
+    if name not in chats:
+        return False
+    del chats[name]
+    chats_save(chats)
+    return True
+
+
+def chat_query(message: str, session_id: str | None, *,
+               model: str = "", provider: str = "") -> tuple[str | None, str]:
+    """Отправить сообщение в сессию чата, вернуть (session_id, ответ).
+
+    Использует `hermes chat -q -Q`: первый вызов создаёт сессию и
+    печатает `session_id: <id>`, последующие продолжают её через --resume.
+    """
+    cmd = ["hermes", "chat", "-q", message, "-Q"]
+    if session_id:
+        cmd += ["--resume", session_id]
+    if model:
+        cmd += ["--model", model]
+    if provider:
+        cmd += ["--provider", provider]
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=CHAT_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return session_id, color(f"⏱ Таймаут: Hermes не ответил за {CHAT_TIMEOUT} сек", "red")
+    except FileNotFoundError:
+        return session_id, color("❌ Hermes не найден в PATH", "red")
+
+    combined = result.stdout + result.stderr
+    if "No session found" in combined or "Session not found" in combined:
+        return None, color(
+            "⚠️ Сессия удалена в Hermes. Начни новую: /new", "yellow",
+        )
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout).strip() or "неизвестная ошибка"
+        return session_id, color(f"❌ Ошибка Hermes: {err}", "red")
+
+    output = result.stdout.strip()
+    new_session_id = session_id
+    # session_id: печатается в stderr в не-tty режиме, в stdout — в tty
+    m = re.search(r"session_id:\s*(\S+)", result.stderr or "")
+    if not m:
+        m = re.search(r"session_id:\s*(\S+)", result.stdout or "")
+    if m:
+        new_session_id = m.group(1)
+    return new_session_id, output
+
+
+def chat_repl(name: str, args: argparse.Namespace) -> None:
+    """Интерактивный REPL-чат с сохранением контекста."""
+    session_id = chat_get_session(name)
+    model = args.model
+    provider = args.provider
+    last_response = ""
+
+    print(color(f"\n💬 Чат: {name}", "bold"))
+    if session_id:
+        print(color(f"   Продолжаю сессию {session_id[:8]}", "dim"))
+    else:
+        print(color("   Новая сессия", "dim"))
+    print(color("   /help — команды, /exit — выход", "dim"))
+
+    while True:
+        try:
+            line = input(color(f"ai:{name}", "green") + color("> ", "dim"))
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        line = line.strip()
+        if not line:
+            continue
+
+        # ── Slash-команды ──
+        if line.startswith("/"):
+            cmd, _, arg = line[1:].partition(" ")
+            cmd = cmd.lower()
+            arg = arg.strip()
+            if cmd in ("exit", "quit"):
+                break
+            elif cmd == "help":
+                print(color(CHAT_HELP, "dim"))
+            elif cmd == "new":
+                if arg:
+                    name = arg
+                session_id = None
+                print(color(f"🆕 Новая сессия: {name}", "green"))
+            elif cmd == "sessions":
+                chat_list()
+            elif cmd == "model":
+                if not arg:
+                    print(color(f"   Текущая модель: {model or 'по умолчанию'}", "dim"))
+                else:
+                    model = arg
+                    print(color(f"🧠 Модель: {model}", "green"))
+            elif cmd == "clear":
+                os.system("clear" if os.name == "posix" else "cls")
+            elif cmd == "send":
+                target = arg or "telegram"
+                if last_response and not last_response.startswith("❌"):
+                    ok = hermes_send(last_response, target)
+                    print(color(
+                        f"📬 Отправлено в Telegram ({target})" if ok
+                        else f"❌ Не удалось отправить ({target})",
+                        "green" if ok else "red",
+                    ))
+                else:
+                    print(color("   Нет ответа для отправки", "yellow"))
+            elif cmd == "delete":
+                if chat_delete(name):
+                    print(color(f"🗑 Чат «{name}» удалён из реестра", "yellow"))
+                else:
+                    print(color(f"   Чат «{name}» не найден", "dim"))
+            else:
+                print(color(f"   Неизвестная команда: /{cmd} (введи /help)", "yellow"))
+            continue
+
+        # ── Отправка сообщения ──
+        first = not session_id
+        new_sid, response = chat_query(line, session_id, model=model, provider=provider)
+        if new_sid:
+            session_id = new_sid
+            chat_save_session(name, session_id, line if first else "")
+        print()
+        print(stylize(response) if not args.no_color else response)
+        print()
+        last_response = response
+
+    print(color("👋 Пока!", "dim"))
 
 
 # ── Управление названиями сессий ─────────────────────────────────────
@@ -498,6 +740,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Отправить результат в Telegram (или указать target)",
     )
     parser.add_argument(
+        "-c", "--copy",
+        action="store_true",
+        help="Скопировать ответ в буфер обмена (требуется xclip или wl-copy)",
+    )
+    parser.add_argument(
         "-r", "--run",
         action="store_true",
         help="В режиме --shell: выполнить команду после генерации",
@@ -516,6 +763,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--fix-sessions",
         action="store_true",
         help="Исправить названия всех старых CLI-сессий в БД Hermes",
+    )
+    parser.add_argument(
+        "--chat",
+        action="store_true",
+        help="Режим чата: интерактивный диалог с контекстом (или сообщение в сессию)",
+    )
+    parser.add_argument(
+        "-n", "--name",
+        default="default",
+        metavar="NAME",
+        help="Имя сессии чата (по умолчанию: default)",
+    )
+    parser.add_argument(
+        "-l", "--list-chats",
+        action="store_true",
+        help="Список сохранённых чатов",
+    )
+    parser.add_argument(
+        "-d", "--delete-chat",
+        metavar="NAME",
+        help="Удалить чат из реестра",
     )
 
     return parser
@@ -559,6 +827,53 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+
+    # ── Чат ────────────────────────────────────────────────────────
+    if args.list_chats:
+        chat_list()
+        sys.exit(0)
+
+    if args.delete_chat:
+        if chat_delete(args.delete_chat):
+            print(color(f"🗑 Чат «{args.delete_chat}» удалён из реестра", "yellow"))
+        else:
+            print(color(f"❌ Чат «{args.delete_chat}» не найден", "red"))
+        sys.exit(0)
+
+    if args.chat:
+        prompt = " ".join(args.query) if args.query else ""
+        has_stdin = not sys.stdin.isatty()
+        stdin_data = sys.stdin.read().strip() if has_stdin else ""
+
+        if prompt or stdin_data:
+            # One-shot: сообщение в сессию с сохранением контекста
+            message = prompt or stdin_data
+            session_id = chat_get_session(args.name)
+            new_sid, response = chat_query(
+                message, session_id, model=args.model, provider=args.provider,
+            )
+            if new_sid:
+                chat_save_session(args.name, new_sid, message)
+            raw = response
+            print(stylize(response) if not args.no_color else response)
+            if args.copy and raw and not raw.startswith("❌"):
+                if copy_to_clipboard(raw):
+                    print(color("📋 Скопировано в буфер обмена", "dim"), file=sys.stderr)
+                else:
+                    print(
+                        color("⚠️  Установи xclip (X11) или wl-copy (Wayland) для --copy", "yellow"),
+                        file=sys.stderr,
+                    )
+            if args.send and raw and not raw.startswith("❌"):
+                ok = hermes_send(raw, args.send)
+                print(color(
+                    f"\n📬 Отправлено в Telegram ({args.send})" if ok
+                    else f"\n❌ Не удалось отправить ({args.send})",
+                    "green" if ok else "red",
+                ), file=sys.stderr)
+        else:
+            chat_repl(args.name, args)
+        sys.exit(0)
 
     # ── Определяем режим ──────────────────────────────────────────
     mode = "general"
@@ -617,6 +932,16 @@ def main() -> None:
         response = stylize(response)
 
     print(response)
+
+    # ── Копирование в буфер обмена ────────────────────────────────
+    if args.copy and raw_response and not raw_response.startswith("❌"):
+        if copy_to_clipboard(raw_response):
+            print(color("📋 Скопировано в буфер обмена", "dim"), file=sys.stderr)
+        else:
+            print(
+                color("⚠️  Установи xclip (X11) или wl-copy (Wayland) для --copy", "yellow"),
+                file=sys.stderr,
+            )
 
     # ── Отправка в Telegram ───────────────────────────────────────
     if args.send and raw_response and not raw_response.startswith("❌"):

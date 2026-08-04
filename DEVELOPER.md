@@ -10,6 +10,9 @@
 ```
 ai-shell/
 ├── bin/ai            # ★ Единственный исполняемый файл (Python)
+├── completions/       # bash/zsh автодополнения
+│   ├── ai.bash        #   bash completion
+│   └── ai.zsh         #   zsh completion
 ├── main.py           # Python-стаб для uv run ai ...
 ├── pyproject.toml    # uv-метаданные
 ├── README.md         # Пользовательская документация
@@ -46,6 +49,8 @@ REPL — в отдельный модуль. Но для MVP монолит оп
 │  hermes_query()    →  subprocess(hermes -z "prompt") │
 │                                                      │
 │  hermes_send()     →  subprocess(hermes send --to)   │
+│                                                      │
+│  copy_to_clipboard() →  xclip / wl-copy              │
 │                                                      │
 │  stylize()         →  пост-процессинг (цвета,       │
 │                        подсветка кода)               │
@@ -233,11 +238,19 @@ ai -m deepseek/deepseek-chat "тест"
 ├── -1..-9 / --verbose (детальность)
 └── --fix-sessions / умные подсказки
 
-Фаза 2: Улучшения       ← следующая
-├── --chat (именованные сессии)
-├── --role (роли/персонажи)
-├── --copy (буфер обмена)
-└── zsh/bash completion
+Фаза 2: Улучшения       ✅ сделано (v0.7.0)
+├── --chat (именованные сессии) ✅
+│   ├── REPL: chat_repl() + slash-команды
+│   ├── one-shot: ai --chat -n имя "вопрос"
+│   ├── реестр: ~/.config/ai-shell/chats.json (имя → session_id)
+│   └── контекст: hermes chat -q -Q [--resume <id>]
+├── --copy (буфер обмена) ✅
+│   ├── -c / --copy — копировать ответ в буфер
+│   └── авто-определение: X11 → xclip, Wayland → wl-copy
+├── zsh/bash completion ✅
+│   ├── completions/ai.bash (статический, флаги + имена чатов)
+│   └── completions/ai.zsh
+└── --role (роли/персонажи)  ← отложено (работает через текст запроса)
 
 Фаза 3: Интеграция
 ├── --file <файл> (контекст из файла)
